@@ -40,6 +40,19 @@ pub fn cap_metrics(
     (remaining, per_tx_cap, window_cap)
 }
 
+/// Global remaining window headroom for a policy: the rolling `window_cap`
+/// minus the (already pruned) global ledger total, or `None` when the global
+/// cap is disabled. This is the no-recipient branch of [`cap_metrics`], so
+/// `status().window_remaining` always agrees with the `remaining_window` a
+/// `check_detailed` call reports for a recipient without a per-recipient
+/// override. Per-recipient headroom stays recipient-targeted and is not
+/// reflected here (a global status has no recipient to project for).
+#[allow(clippy::must_use_candidate)]
+pub fn global_window_remaining(policy: &PolicyConfig, ledger: &Ledger) -> Option<i128> {
+    let remaining = policy.window_cap.saturating_sub(ledger.total).max(0);
+    (policy.window_cap > 0).then_some(remaining)
+}
+
 /// Evaluate dead-man switch health given current timestamp, last heartbeat, and policy config.
 pub fn dms_health(
     now: u64,
@@ -509,19 +522,49 @@ mod tests {
     }
 
     #[test]
+    fn invalid_amount_rejections_do_not_mutate_window() {
+        let env = Env::default();
+        let sa = self_addr(&env);
+        let mut p = base_policy(&env);
+        p.window_cap = 100;
+        let mut l = Ledger::empty(&env);
+        l.admit(1000, 7);
+
+        for amount in [0, -1] {
+            let before = l.clone();
+            let d = decide(
+                &env,
+                &sa,
+                Some(&p),
+                &alive(),
+                &mut l,
+                1000,
+                vec![&env, transfer_ctx(&env, 1, 2, amount)],
+            );
+            assert!(matches!(
+                d.first().unwrap(),
+                Decision::Blocked(Error::InvalidAmount)
+            ));
+            assert_eq!(l, before, "rejected amount {amount} mutated the window");
+        }
+    }
+
+    #[test]
     fn per_tx_cap_enforced() {
         let env = Env::default();
         let sa = self_addr(&env);
         let mut p = base_policy(&env);
         p.per_tx_cap = 10;
         let mut l = Ledger::empty(&env);
+        l.admit(1000, 7);
+        let before = l.clone();
         let ctx = vec![&env, transfer_ctx(&env, 1, 2, 11)];
         let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
         assert!(matches!(
             d.first().unwrap(),
             Decision::Blocked(Error::PerTxCapExceeded)
         ));
-        assert_eq!(l.total, 0);
+        assert_eq!(l, before);
     }
 
     #[test]
@@ -530,12 +573,15 @@ mod tests {
         let sa = self_addr(&env);
         let p = Some(base_policy(&env));
         let mut l = Ledger::empty(&env);
+        l.admit(1000, 7);
+        let before = l.clone();
         let ctx = vec![&env, transfer_ctx(&env, 1, 99, 5)];
         let d = decide(&env, &sa, p.as_ref(), &alive(), &mut l, 1000, ctx.clone());
         assert!(matches!(
             d.first().unwrap(),
             Decision::Blocked(Error::RecipientNotAllowed)
         ));
+        assert_eq!(l, before);
         let mut p2 = base_policy(&env);
         p2.allow_any_recipient = true;
         let ctx2 = vec![&env, transfer_ctx(&env, 1, 99, 5)];
@@ -554,12 +600,15 @@ mod tests {
         p.recipients = vec![&env, addr(&env, 2), blocked_addr.clone()];
         p.blocked_recipients = vec![&env, blocked_addr.clone()];
         let mut l = Ledger::empty(&env);
+        l.admit(1000, 7);
+        let before = l.clone();
         let ctx = vec![&env, transfer_ctx(&env, 1, 3, 5)];
         let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
         assert!(matches!(
             d.first().unwrap(),
             Decision::Blocked(Error::RecipientBlocked)
         ));
+        assert_eq!(l, before);
 
         // allow_any_recipient true but address is blocked -> still blocked.
         let mut p2 = base_policy(&env);
@@ -570,6 +619,7 @@ mod tests {
             d2.first().unwrap(),
             Decision::Blocked(Error::RecipientBlocked)
         ));
+        assert_eq!(l, before);
 
         // A different non-blocked recipient passes under the escape hatch.
         let ctx3 = vec![&env, transfer_ctx(&env, 1, 4, 5)];
@@ -619,6 +669,7 @@ mod tests {
             vec![&env, transfer_ctx(&env, 1, 2, 60)],
         );
         assert!(matches!(d1.first().unwrap(), Decision::Allowed));
+        let before_rejection = l.clone();
         let d2 = decide(
             &env,
             &sa,
@@ -632,6 +683,7 @@ mod tests {
             d2.first().unwrap(),
             Decision::Blocked(Error::WindowCapExceeded)
         ));
+        assert_eq!(l, before_rejection);
         let d3 = decide(
             &env,
             &sa,
@@ -656,12 +708,13 @@ mod tests {
             transfer_ctx(&env, 1, 2, 60),
             transfer_ctx(&env, 1, 2, 60),
         ];
+        let before = l.clone();
         let d = decide(&env, &sa, Some(&p), &alive(), &mut l, 1000, ctx.clone());
         assert!(matches!(
             d.get(1).unwrap(),
             Decision::Blocked(Error::WindowCapExceeded)
         ));
-        assert_eq!(l.total, 0);
+        assert_eq!(l, before);
     }
 
     #[test]
